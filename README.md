@@ -20,19 +20,19 @@ AI coding agents often need to run slow commands: test suites, builds, dev serve
 Install from GitHub:
 
 ```bash
-pi install git:github.com/sshkeda/pi-background-bash
+pi install git:github.com/chthub/pi-background-bash
 ```
 
 Try without installing:
 
 ```bash
-pi -e git:github.com/sshkeda/pi-background-bash
+pi -e git:github.com/chthub/pi-background-bash
 ```
 
 Local development:
 
 ```bash
-git clone https://github.com/sshkeda/pi-background-bash.git
+git clone https://github.com/chthub/pi-background-bash.git
 cd pi-background-bash
 npm install
 npm test
