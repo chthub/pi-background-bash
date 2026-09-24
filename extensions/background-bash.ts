@@ -4,12 +4,49 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { AgentToolUpdateCallback, BashToolDetails, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentToolUpdateCallback, BashToolDetails, ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Text } from "@earendil-works/pi-tui";
-import { createPiPending } from "pi-pending";
-import { formatTruncationNotice, piContext, truncateContextText } from "pi-context";
+import { Box, Container, Text, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+
+type TruncationInfo = { truncated: boolean; originalLines: number; keptLines: number; originalBytes: number; maxLines: number; maxBytes: number };
+
+function byteLength(text: string): number {
+	return Buffer.byteLength(text, "utf8");
+}
+
+function truncateContextText(text: string, options: { mode?: "tail"; maxLines: number; maxBytes: number; appendNotice?: boolean }): { content: string; truncation?: TruncationInfo } {
+	const lines = text.split(/\r?\n/);
+	const originalBytes = byteLength(text);
+	let kept = lines;
+	if (lines.length > options.maxLines) kept = lines.slice(-options.maxLines);
+	let content = kept.join("\n");
+	while (byteLength(content) > options.maxBytes && kept.length > 1) {
+		kept = kept.slice(Math.max(1, Math.ceil(kept.length * 0.1)));
+		content = kept.join("\n");
+	}
+	if (byteLength(content) > options.maxBytes) {
+		const buf = Buffer.from(content, "utf8");
+		content = buf.subarray(Math.max(0, buf.length - options.maxBytes)).toString("utf8");
+	}
+	const truncated = lines.length !== kept.length || originalBytes > options.maxBytes;
+	const truncation = truncated ? { truncated, originalLines: lines.length, keptLines: kept.length, originalBytes, maxLines: options.maxLines, maxBytes: options.maxBytes } : undefined;
+	return { content, truncation };
+}
+
+function formatTruncationNotice(truncation: TruncationInfo, mode: "tail" = "tail"): string {
+	return `[truncated ${mode}: kept ${truncation.keptLines}/${truncation.originalLines} lines, max ${truncation.maxBytes} bytes]`;
+}
+
+function piContext(input: { source: string; kind: string; id?: string; attrs?: Record<string, unknown>; body?: string }): string {
+	const escapeAttr = (value: unknown) => String(value ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r/g, "&#13;").replace(/\n/g, "&#10;");
+	const attrs = { source: input.source, kind: input.kind, id: input.id, ...(input.attrs ?? {}) };
+	const rendered = Object.entries(attrs)
+		.filter(([, value]) => value !== undefined && value !== null)
+		.map(([key, value]) => `${key}="${escapeAttr(value)}"`)
+		.join(" ");
+	return `<pi_context ${rendered}>\n${input.body ?? ""}\n</pi_context>`;
+}
 
 const MAX_ACTIVE_JOBS = 10;
 const MAX_RESULT_LINES = 2000;
@@ -112,11 +149,125 @@ const schema = Type.Object({
 const JOB_ID_PREFIX = "bg";
 const JOB_ID_WIDTH = 3;
 
+type PendingJobInput = {
+	id: string;
+	text: string;
+	startedAt?: number;
+	details?: Record<string, unknown>;
+};
+
+type PendingJob = Required<Pick<PendingJobInput, "id" | "text">> & {
+	startedAt: number;
+	sequence: number;
+	details?: Record<string, unknown>;
+};
+
+type PendingRegistry = {
+	attach(ui: ExtensionUIContext): void;
+	detach(ui?: ExtensionUIContext): void;
+	start(item: PendingJobInput): void;
+	finish(id: string): void;
+	clear(): void;
+};
+
+function formatPendingElapsed(startedAt: number, now = Date.now()): string {
+	const totalSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+	if (minutes > 0) return `${minutes}m ${seconds}s`;
+	return `${seconds}s`;
+}
+
+function padVisible(text: string, width: number): string {
+	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
+}
+
+function createPendingWidget(items: Map<string, PendingJob>, tui: TUI, theme: Theme): Component & { dispose(): void } {
+	const interval = setInterval(() => tui.requestRender(), 1000);
+	interval.unref?.();
+	return {
+		render(width: number): string[] {
+			if (width <= 0 || items.size === 0) return [];
+			const rows = [...items.values()]
+				.sort((a, b) => a.sequence - b.sequence)
+				.map((item) => ({
+					item,
+					elapsed: formatPendingElapsed(item.startedAt),
+					body: `$ ${normalizeCommandForStatus(item.text)}`,
+				}));
+			const elapsedWidth = rows.reduce((max, row) => Math.max(max, "4m 16s".length, visibleWidth(row.elapsed)), 0);
+			const idWidth = rows.reduce((max, row) => Math.max(max, visibleWidth(row.item.id)), 0);
+			return rows.map((row) => {
+				const prefix = `${padVisible(row.elapsed, elapsedWidth)} ${padVisible(row.item.id, idWidth)} `;
+				const line = padVisible(truncateToWidth(`${prefix}${row.body}`, width, "..."), width);
+				return theme.bg("toolPendingBg", theme.fg("toolTitle", line));
+			});
+		},
+		invalidate() {},
+		dispose() {
+			clearInterval(interval);
+		},
+	};
+}
+
+function createInlinePendingRegistry(): PendingRegistry {
+	const widgetId = "background-bash-pending";
+	const items = new Map<string, PendingJob>();
+	let ui: ExtensionUIContext | undefined;
+	let widgetInstalled = false;
+	let nextSequence = 1;
+	const reconcile = () => {
+		if (!ui) return;
+		if (items.size === 0) {
+			if (widgetInstalled) {
+				ui.setWidget(widgetId, undefined);
+				widgetInstalled = false;
+			}
+			return;
+		}
+		if (widgetInstalled) return;
+		ui.setWidget(widgetId, (tui, theme) => createPendingWidget(items, tui, theme), { placement: "belowEditor" });
+		widgetInstalled = true;
+	};
+	return {
+		attach(nextUi) {
+			ui = nextUi;
+			reconcile();
+		},
+		detach(detachingUi) {
+			if (detachingUi && ui !== detachingUi) return;
+			if (ui && widgetInstalled) ui.setWidget(widgetId, undefined);
+			ui = undefined;
+			widgetInstalled = false;
+		},
+		start(item) {
+			const id = normalizeCommandForStatus(item.id);
+			if (!id) throw new Error("pending job id is required");
+			const existing = items.get(id);
+			items.set(id, {
+				id,
+				text: item.text,
+				startedAt: item.startedAt ?? existing?.startedAt ?? Date.now(),
+				sequence: existing?.sequence ?? nextSequence++,
+				...(item.details ? { details: item.details } : {}),
+			});
+			reconcile();
+		},
+		finish(id) {
+			items.delete(normalizeCommandForStatus(id));
+			reconcile();
+		},
+		clear() {
+			items.clear();
+			reconcile();
+		},
+	};
+}
+
 const activeJobs = new Map<string, ActiveJob>();
-const pendingJobs = createPiPending({
-	namespace: "background-bash",
-	format: (job) => `$ ${normalizeCommandForStatus(job.text)}`,
-});
+const pendingJobs = createInlinePendingRegistry();
 let nextJobNumber = 1;
 let shuttingDown = false;
 let processHooksInstalled = false;

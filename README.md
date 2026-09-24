@@ -11,6 +11,8 @@ As of v1, PBB-owned execution is the baseline: jobs are recorded with logs plus 
 
 When a background command finishes, the extension injects a follow-up result into the session and wakes the agent.
 
+While jobs are running, a compact pending-job widget is shown below Pi's editor/input area. This fork keeps that widget implementation inline and does not depend on `pi-pending`.
+
 ## Why
 
 AI coding agents often need to run slow commands: test suites, builds, dev servers, downloads, deploys, benchmark loops, and watchers. Without background execution, the agent gets stuck waiting. With this extension, the agent can continue useful work and handle the command output when it arrives.
@@ -20,13 +22,15 @@ AI coding agents often need to run slow commands: test suites, builds, dev serve
 Install from GitHub:
 
 ```bash
-pi install git:github.com/chthub/pi-background-bash
+NPM_CONFIG_ALLOW_GIT=all pi install git:github.com/chthub/pi-background-bash
 ```
+
+`NPM_CONFIG_ALLOW_GIT=all` is needed with npm 12+ because this package depends on `pi-lane` through a Git reference.
 
 Try without installing:
 
 ```bash
-pi -e git:github.com/chthub/pi-background-bash
+NPM_CONFIG_ALLOW_GIT=all pi -e git:github.com/chthub/pi-background-bash
 ```
 
 Local development:
@@ -34,7 +38,7 @@ Local development:
 ```bash
 git clone https://github.com/chthub/pi-background-bash.git
 cd pi-background-bash
-npm install
+NPM_CONFIG_ALLOW_GIT=all npm install
 npm test
 pi -e .
 ```
@@ -134,6 +138,12 @@ The extension updates the `bash` tool metadata exposed to models:
 - background completion messages are described as final bash results
 
 No global Pi prompt patch is required.
+
+## Fork notes
+
+This fork inlines the small context-formatting/truncation helpers that upstream imported from `pi-context`, and inlines the pending-job widget that upstream imported from `pi-pending`.
+
+`pi-lane` is intentionally kept as the only runtime package dependency. `pbb` uses it for multi-instance Pi identity and owner liveness, so commands such as `pbb list`, `pbb status`, and `pbb kill` can distinguish jobs owned by the current live Pi instance from jobs owned by other or stale instances.
 
 ## Security
 
