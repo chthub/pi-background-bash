@@ -9,7 +9,7 @@ Async/background `bash` for [Pi](https://github.com/earendil-works/pi): keep usi
 
 As of v1, PBB-owned execution is the baseline: jobs are recorded with logs plus `pid`/`pgid`, and full output is available through `pbb tail`.
 
-When a background command finishes, the extension sends a completion result to the session. If the agent is already working, Pi can deliver it at the next tool-batch boundary (between tool calls), without waiting for the agent's turn to end. If idle, the result wakes the agent. This does not interrupt a tool call in progress.
+When a background command finishes, the extension sends its result as a Pi `steer` message. During an active turn, Pi queues it until the next tool-batch boundary (between tool calls), rather than waiting for `agent_end` or starting a nested provider request. If idle, the result wakes the agent. It does not interrupt a tool call in progress.
 
 While jobs are running, a compact pending-job widget is shown below Pi's editor/input area. This fork keeps that widget implementation inline and does not depend on `pi-pending`.
 
