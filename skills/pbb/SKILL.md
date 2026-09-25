@@ -45,7 +45,7 @@ pbb kill --instance <instance_id> --stale <job_id>
 
 ## Agent guidelines
 
-- After starting a long background bash, normally wait for the completion follow-up and continue independent work.
+- After starting a long background bash, continue independent work. Completion can be delivered between tool calls at the next tool-batch boundary, even during an active turn; it does not interrupt an in-progress tool call. If idle, delivery wakes the agent.
 - Use `pbb list` or `pbb status <job>` only when you need progress before completion, need to manage/kill a job, or suspect the follow-up was missed.
 - Use `pbb tail <job>` for bounded output instead of rerunning the command.
 - If a monitoring command is already running or sleeping in the background, do **not** schedule another delayed check such as `sleep 120; ...`, `sleep 300; ...`, or another polling loop. Use `pbb tail <job>` / `pbb status <job>` instead.

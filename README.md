@@ -9,7 +9,7 @@ Async/background `bash` for [Pi](https://github.com/earendil-works/pi): keep usi
 
 As of v1, PBB-owned execution is the baseline: jobs are recorded with logs plus `pid`/`pgid`, and full output is available through `pbb tail`.
 
-When a background command finishes, the extension injects a follow-up result into the session and wakes the agent.
+When a background command finishes, the extension sends a completion result to the session. If the agent is already working, Pi can deliver it at the next tool-batch boundary (between tool calls), without waiting for the agent's turn to end. If idle, the result wakes the agent. This does not interrupt a tool call in progress.
 
 While jobs are running, a compact pending-job widget is shown below Pi's editor/input area. This fork keeps that widget implementation inline and does not depend on `pi-pending`.
 
@@ -63,7 +63,7 @@ Add a timeout if you want Pi to kill the command after a fixed number of seconds
 bash({ command: "npm test", background: true, timeout: 120 })
 ```
 
-Completion results arrive as Pi context messages:
+Completion results arrive as Pi context messages, including while the agent continues making other tool calls:
 
 ```xml
 <pi_context source="pi-background-bash" kind="background_bash_result" id="bg001" outcome="exit" exit_code="0">
@@ -135,7 +135,7 @@ The extension updates the `bash` tool metadata exposed to models:
 - the tool description documents automatic backgrounding
 - prompt snippets/guidelines teach the agent not to retry just to wait
 - prompt guidelines teach the agent to use `pbb list/status/tail` for inspection
-- background completion messages are described as final bash results
+- background completion messages are described as final bash results that can arrive between tool calls
 
 No global Pi prompt patch is required.
 
