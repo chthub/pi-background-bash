@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createMock, createControllableBrain, script, text, toolCall } from "./harness/index.mjs";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -834,6 +834,11 @@ test("pbb shows pi-lane owner liveness and stale status", () => {
     const session = execFileSync(process.execPath, [PBB_CLI, "list", "--scope", "session"], { env, encoding: "utf8" });
     assert.match(session, /owner=live/);
     assert.match(session, /owner=stale/);
+    const jobs = JSON.parse(execFileSync(process.execPath, [PBB_CLI, "list", "--scope", "session", "--json"], { env, encoding: "utf8" })).jobs;
+    assert.equal(jobs.find((job) => job.instanceId === "current").ownerLive, true);
+    assert.equal(jobs.find((job) => job.instanceId === "current").ownerStale, false);
+    assert.equal(jobs.find((job) => job.instanceId === "stale").ownerLive, false);
+    assert.equal(jobs.find((job) => job.instanceId === "stale").ownerStale, true);
     const instances = execFileSync(process.execPath, [PBB_CLI, "instances"], { env, encoding: "utf8" });
     assert.match(instances, /instance=current live=true/);
     assert.match(instances, /instance=stale live=false/);
@@ -841,6 +846,65 @@ test("pbb shows pi-lane owner liveness and stale status", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const otherHeartbeat of [false, true]) {
+  test(`pbb reports missing owner heartbeat as unknown and refuses stale kill (other heartbeat ${otherHeartbeat})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-unknown-${process.pid}-`));
+    const pbbRoot = join(dir, "pbb");
+    const laneRoot = join(dir, "lane");
+    const key = "unknown-key";
+    const instance = "unknown-owner";
+    const base = join(pbbRoot, "sessions", key, "instances", instance);
+    const jobPath = join(base, "jobs", "bg001.json");
+    mkdirSync(dirname(jobPath), { recursive: true });
+    if (otherHeartbeat) {
+      const laneBase = join(laneRoot, "sessions", key, "instances");
+      mkdirSync(laneBase, { recursive: true });
+      writeFileSync(join(laneBase, "other.json"), JSON.stringify({ instanceId: "other", status: "idle", lastSeenAt: new Date().toISOString() }));
+    }
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    child.unref();
+
+    try {
+      const recordedJob = { jobId: "bg001", globalJobId: `${instance}:bg001`, status: "running", command: "unknown owner", startedAt: new Date().toISOString(), instanceId: instance, runner: "pbb", pid: child.pid, pgid: child.pid };
+      writeFileSync(jobPath, JSON.stringify(recordedJob));
+      // Exercise PBB's fallback identity, as in a real session without pi-lane.
+      const env = { ...process.env, PBB_ROOT: pbbRoot, PBB_SESSION_KEY: key, PBB_SESSION_ID: "unknown-session", PBB_INSTANCE_ID: instance, PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: "", PI_LANE_SESSION_ID: "", PI_LANE_SESSION_FILE: "", PI_LANE_INSTANCE_ID: "", PBB_PIL_BIN: PIL_CLI };
+      const runCli = (...args) => execFileSync(process.execPath, [PBB_CLI, ...args], { env, encoding: "utf8", stdio: "pipe" });
+      const listed = runCli("list");
+      assert.match(listed, /owner=unknown/);
+      assert.doesNotMatch(listed, /owner=stale/);
+      for (const args of [["list", "--json"], ["status", "bg001", "--json"], ["tail", "bg001", "--json"]]) {
+        const result = JSON.parse(runCli(...args));
+        const job = result.job ?? result.jobs[0];
+        assert.equal(job.ownerStatus, "unknown");
+        assert.equal(job.ownerLive, null);
+        assert.equal(job.ownerStale, null);
+      }
+      assert.throws(() => runCli("kill", "bg001", "--stale"), (error) => {
+        assert.equal(error.status, 4);
+        assert.match(String(error.stderr), /owner_liveness_unknown/);
+        return true;
+      });
+      assert.deepEqual(JSON.parse(readFileSync(jobPath, "utf8")), recordedJob);
+      assert.equal(existsSync(join(base, "requests")), false);
+      process.kill(child.pid, 0);
+
+      const queued = runCli("kill", "bg001");
+      assert.match(queued, /kill requested for bg001/);
+      assert.match(queued, /Owner liveness is unknown/);
+      assert.doesNotMatch(queued, /appears stale|use: pbb kill .*--stale/);
+      const requests = readdirSync(join(base, "requests")).map((file) => JSON.parse(readFileSync(join(base, "requests", file), "utf8")));
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].jobId, "bg001");
+      process.kill(child.pid, 0);
+    } finally {
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      await waitForCondition(() => child.exitCode !== null || child.signalCode !== null, 5_000);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("pbb lists and tails current pi-lane instance background jobs", async () => {
   const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-${process.pid}-${Date.now()}-`));
@@ -1114,6 +1178,10 @@ test("pbb kill --stale can signal a recorded stale process group", async () => {
   const marker = join(dir, "should-not-exist");
   const key = "stale-kill-key";
   const instance = "stale-owner";
+  const laneRoot = join(dir, "lane");
+  const laneBase = join(laneRoot, "sessions", key, "instances");
+  mkdirSync(laneBase, { recursive: true });
+  writeFileSync(join(laneBase, `${instance}.json`), JSON.stringify({ instanceId: instance, status: "disconnected", lastSeenAt: "2000-01-01T00:00:00.000Z" }));
   const jobDir = join(pbbRoot, "sessions", key, "instances", instance, "jobs");
   mkdirSync(jobDir, { recursive: true });
   const child = spawn("bash", ["-lc", `sleep 5; echo survived > ${JSON.stringify(marker)}`], { detached: true, stdio: "ignore" });
@@ -1121,7 +1189,7 @@ test("pbb kill --stale can signal a recorded stale process group", async () => {
 
   try {
     writeFileSync(join(jobDir, "bg999.json"), JSON.stringify({ jobId: "bg999", globalJobId: `${instance}:bg999`, status: "running", command: "stale", startedAt: new Date().toISOString(), instanceId: instance, runner: "pbb", pid: child.pid, pgid: child.pid }));
-    const env = { ...process.env, PBB_ROOT: pbbRoot, PI_LANE_SESSION_KEY: key, PI_LANE_SESSION_ID: "stale-session", PI_LANE_INSTANCE_ID: "current" };
+    const env = { ...process.env, PBB_ROOT: pbbRoot, PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: key, PI_LANE_SESSION_ID: "stale-session", PI_LANE_INSTANCE_ID: "current", PBB_PIL_BIN: PIL_CLI };
     const out = execFileSync(process.execPath, [PBB_CLI, "kill", "bg999", "--instance", instance, "--stale"], { env, encoding: "utf8" });
     assert.match(out, /stale process-group kill sent/);
     await waitForCondition(() => {

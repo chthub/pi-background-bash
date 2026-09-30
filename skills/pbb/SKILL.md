@@ -37,7 +37,7 @@ pbb status --instance <instance_id> <job_id>
 pbb tail --instance <instance_id> <job_id>
 ```
 
-PBB reads lane/runtime liveness from the tracked `pil` CLI. If owner liveness is shown as stale/disconnected, do not assume cooperative kill worked. Jobs record `pgid`; stale process-group kill requires explicit intent:
+PBB reads lane/runtime liveness from the tracked `pil` CLI. If no owner heartbeat exists, listings show `owner=unknown` and JSON has `ownerLive: null` / `ownerStale: null`; this does not mean the runtime has disconnected. Ordinary `pbb kill` can still queue a cooperative request, but `--stale` direct signaling is refused for unknown owners. If owner liveness is shown as stale/disconnected, do not assume cooperative kill worked. Jobs record `pgid`; stale process-group kill requires explicit intent:
 
 ```bash
 pbb kill --instance <instance_id> --stale <job_id>

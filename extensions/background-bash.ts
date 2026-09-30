@@ -53,7 +53,7 @@ const MAX_ACTIVE_JOBS = 10;
 const MAX_RESULT_LINES = 2000;
 const MAX_RESULT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = 1024 * 1024;
-const DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS = 30;
+const DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS = 60;
 const CUSTOM_TYPE = "background_bash_result";
 
 type Outcome = "running" | "exit" | "timeout" | "abort" | "error";

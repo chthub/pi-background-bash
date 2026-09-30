@@ -5,7 +5,7 @@ Async/background `bash` for [Pi](https://github.com/earendil-works/pi): keep usi
 `pi-background-bash` replaces Pi's bash execution with the PBB runner and adds two quality-of-life features:
 
 - `background: true` starts a command in the background immediately.
-- normal foreground commands automatically move to the background after 30 seconds.
+- normal foreground commands automatically move to the background after 60 seconds.
 
 As of v1, PBB-owned execution is the baseline: jobs are recorded with logs plus `pid`/`pgid`, and full output is available through `pbb tail`.
 
@@ -47,7 +47,7 @@ pi -e .
 
 ## Usage
 
-Run a command normally. If it is still running after 30 seconds, it automatically moves to the background:
+Run a command normally. If it is still running after 60 seconds, it automatically moves to the background:
 
 ```ts
 bash({ command: "npm test" })
@@ -136,13 +136,13 @@ Background job state is stored under:
   logs/{jobId}.log
 ```
 
-`pbb list` and `pbb status` show owner liveness through the tracked `pil` CLI from `pi-lane`, so stale/disconnected owners are visible instead of silently confused with the current runtime. If tracked `pi-lane`/`pil` is missing or fails, `pbb` hard-fails instead of silently degrading liveness to unknown.
+`pbb list` and `pbb status` show owner liveness through the tracked `pil` CLI from `pi-lane`, so stale/disconnected owners are visible instead of silently confused with the current runtime. If `pil` succeeds but has no heartbeat for the owner (for example, the `pi-lane` extension is not loaded), liveness is **unknown**, not stale: listings show `owner=unknown`, and JSON reports `ownerLive: null` and `ownerStale: null`. Known live and stale owners retain boolean values. If tracked `pi-lane`/`pil` is missing or fails, `pbb` hard-fails instead of silently degrading liveness to unknown.
 
-`pbb kill` writes a kill request into the owning instance mailbox. A live `pi-background-bash` runtime polls that mailbox and aborts the matching in-process job. Jobs record `pid`/`pgid`, so the runtime kills the full process group. If the owner is stale, `pbb kill --stale --instance <id> <job>` can signal the recorded process group explicitly.
+`pbb kill` writes a kill request into the owning instance mailbox. A live `pi-background-bash` runtime polls that mailbox and aborts the matching in-process job. Jobs record `pid`/`pgid`, so the runtime kills the full process group. If the owner is confirmed stale, `pbb kill --stale --instance <id> <job>` can signal the recorded process group explicitly. This direct-signal mode is refused when owner liveness is unknown; ordinary `pbb kill` can still queue a cooperative request.
 
 ## Configuration
 
-Default auto-background threshold: `30` seconds.
+Default auto-background threshold: `60` seconds.
 
 Configure the global threshold in `~/.pi-background-bash/config.json`:
 
