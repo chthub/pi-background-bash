@@ -19,6 +19,8 @@ AI coding agents often need to run slow commands: test suites, builds, dev serve
 
 ## Install
 
+Requires Node.js **22.19 or newer**. The development suite targets **Pi 0.99.1**, including its built-in codemode tool.
+
 Install from GitHub:
 
 ```bash
@@ -72,6 +74,39 @@ Completion results arrive as Pi context messages, including while the agent cont
 ```
 
 Commands run through the PBB-owned bash runner (`bash -lc`) so background jobs have recorded `pid`/`pgid` and can be killed as process groups. Verbose completion messages are truncated in-session with a `pbb tail <job> --full` hint; the full output is kept in the PBB log. See [`docs/pbb-runner.md`](docs/pbb-runner.md) for the v1 runner contract.
+
+### Codemode return values
+
+In Pi 0.99.1 codemode scripts, `await tools.bash(...)` returns a structured object. Foreground commands that exit normally return:
+
+```ts
+{
+  status: "completed",
+  output: "hello\n",
+  exit_code: 0,
+  wall_time_seconds: 0.01,
+  truncated: false
+}
+```
+
+`output` is combined stdout and stderr, preserving whitespace and empty output. Nonzero exits also resolve to this object; check `exit_code`. Direct model-facing bash calls still report nonzero exits as errors. Foreground timeouts and aborts reject instead of returning a completed object.
+
+Structured output retains at most the first and last 512 KiB, with an omission marker between them and UTF-8 boundaries preserved. When output is truncated, `truncated` is `true` and `full_output_path` points to a file containing the complete output. This limit is separate from the smaller, tail-only model-facing output limit.
+
+Both `background: true` and automatic backgrounding return an acknowledgement:
+
+```ts
+{
+  status: "running",
+  output: "",
+  exit_code: null,
+  wall_time_seconds: 0.01,
+  truncated: false,
+  job_id: "bg001"
+}
+```
+
+Awaiting this value does **not** wait for the command to finish. Its eventual result arrives through the usual background `steer` message; use `pbb status` or `pbb tail` to inspect the job. The completion message is not another return value from the original codemode call.
 
 ## v1 migration
 
@@ -159,6 +194,8 @@ npm test
 ```
 
 This repo uses Lefthook for local pre-commit checks. The test suite uses [`pi-mock`](https://github.com/sshkeda/pi-mock) to exercise the extension against a real Pi process.
+
+Tests resolve the CLI from the installed `@earendil-works/pi-coding-agent` package instead of using a global `pi`. Set `PBB_TEST_PI_BINARY=/absolute/path/to/pi` to exercise another installation explicitly. Codemode tests enable `builtin:codemode` with `--tools bash,codemode`; they cover completed results, nonzero exits, output truncation, background acknowledgements/completions, and timeout/abort behavior. `pi-mock` is isolated in a private test workspace so its older peer dependencies do not determine the runtime under test.
 
 ## License
 

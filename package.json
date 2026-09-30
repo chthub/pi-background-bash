@@ -39,22 +39,22 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && node --test --test-force-exit test/*.mjs",
-    "test:node": "node --test --test-force-exit",
+    "test:node": "node --test --test-force-exit test/*.mjs",
     "hooks:install": "lefthook install"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-agent-core": "^0.99.1",
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@earendil-works/pi-tui": "^0.99.1",
+    "typebox": "^1.3.27"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.74.0",
-    "@earendil-works/pi-coding-agent": "0.74.0",
+    "@earendil-works/pi-agent-core": "0.99.1",
+    "@earendil-works/pi-coding-agent": "0.99.1",
+    "@earendil-works/pi-tui": "0.99.1",
     "@types/node": "^22.0.0",
     "lefthook": "^1.10.10",
-    "pi-mock": "github:sshkeda/pi-mock",
-    "typebox": "^1.0.55",
+    "typebox": "^1.3.27",
     "typescript": "^5.0.0"
   },
   "files": [
@@ -67,6 +67,12 @@
     "LICENSE"
   ],
   "dependencies": {
-    "pi-lane": "git+https://github.com/sshkeda/pi-lane.git#929a74b"
-  }
+    "pi-lane": "git+https://github.com/sshkeda/pi-lane.git#929a74b52841add7a96deaaec79d3fae41a29715"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "workspaces": [
+    "test/harness"
+  ]
 }

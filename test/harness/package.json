@@ -1,0 +1,9 @@
+{
+  "name": "@pi-background-bash/test-harness",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.74.0",
+    "pi-mock": "github:sshkeda/pi-mock#4437fe56d04e56406be8de8c8fe2432e3f78425d"
+  }
+}
