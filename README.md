@@ -5,7 +5,7 @@ Async/background `bash` for [Pi](https://github.com/earendil-works/pi): keep usi
 `pi-background-bash` replaces Pi's bash execution with the PBB runner and adds two quality-of-life features:
 
 - `background: true` starts a command in the background immediately.
-- normal foreground commands automatically move to the background after 30 seconds.
+- normal foreground commands automatically move to the background after 60 seconds.
 
 As of v1, PBB-owned execution is the baseline: jobs are recorded with logs plus `pid`/`pgid`, and full output is available through `pbb tail`.
 
@@ -18,6 +18,8 @@ While jobs are running, a compact pending-job widget is shown below Pi's editor/
 AI coding agents often need to run slow commands: test suites, builds, dev servers, downloads, deploys, benchmark loops, and watchers. Without background execution, the agent gets stuck waiting. With this extension, the agent can continue useful work and handle the command output when it arrives.
 
 ## Install
+
+Requires Node.js **22.19 or newer**. The development suite targets **Pi 0.99.1**, including its built-in codemode tool.
 
 Install from GitHub:
 
@@ -45,7 +47,7 @@ pi -e .
 
 ## Usage
 
-Run a command normally. If it is still running after 30 seconds, it automatically moves to the background:
+Run a command normally. If it is still running after 60 seconds, it automatically moves to the background:
 
 ```ts
 bash({ command: "npm test" })
@@ -72,6 +74,39 @@ Completion results arrive as Pi context messages, including while the agent cont
 ```
 
 Commands run through the PBB-owned bash runner (`bash -lc`) so background jobs have recorded `pid`/`pgid` and can be killed as process groups. Verbose completion messages are truncated in-session with a `pbb tail <job> --full` hint; the full output is kept in the PBB log. See [`docs/pbb-runner.md`](docs/pbb-runner.md) for the v1 runner contract.
+
+### Codemode return values
+
+In Pi 0.99.1 codemode scripts, `await tools.bash(...)` returns a structured object. Foreground commands that exit normally return:
+
+```ts
+{
+  status: "completed",
+  output: "hello\n",
+  exit_code: 0,
+  wall_time_seconds: 0.01,
+  truncated: false
+}
+```
+
+`output` is combined stdout and stderr, preserving whitespace and empty output. Nonzero exits also resolve to this object; check `exit_code`. Direct model-facing bash calls still report nonzero exits as errors. Foreground timeouts and aborts reject instead of returning a completed object.
+
+Structured output retains at most the first and last 512 KiB, with an omission marker between them and UTF-8 boundaries preserved. When output is truncated, `truncated` is `true` and `full_output_path` points to a file containing the complete output. This limit is separate from the smaller, tail-only model-facing output limit.
+
+Both `background: true` and automatic backgrounding return an acknowledgement:
+
+```ts
+{
+  status: "running",
+  output: "",
+  exit_code: null,
+  wall_time_seconds: 0.01,
+  truncated: false,
+  job_id: "bg001"
+}
+```
+
+Awaiting this value does **not** wait for the command to finish. Its eventual result arrives through the usual background `steer` message; use `pbb status` or `pbb tail` to inspect the job. The completion message is not another return value from the original codemode call.
 
 ## v1 migration
 
@@ -101,13 +136,13 @@ Background job state is stored under:
   logs/{jobId}.log
 ```
 
-`pbb list` and `pbb status` show owner liveness through the tracked `pil` CLI from `pi-lane`, so stale/disconnected owners are visible instead of silently confused with the current runtime. If tracked `pi-lane`/`pil` is missing or fails, `pbb` hard-fails instead of silently degrading liveness to unknown.
+`pbb list` and `pbb status` show owner liveness through the tracked `pil` CLI from `pi-lane`, so stale/disconnected owners are visible instead of silently confused with the current runtime. If `pil` succeeds but has no heartbeat for the owner (for example, the `pi-lane` extension is not loaded), liveness is **unknown**, not stale: listings show `owner=unknown`, and JSON reports `ownerLive: null` and `ownerStale: null`. Known live and stale owners retain boolean values. If tracked `pi-lane`/`pil` is missing or fails, `pbb` hard-fails instead of silently degrading liveness to unknown.
 
-`pbb kill` writes a kill request into the owning instance mailbox. A live `pi-background-bash` runtime polls that mailbox and aborts the matching in-process job. Jobs record `pid`/`pgid`, so the runtime kills the full process group. If the owner is stale, `pbb kill --stale --instance <id> <job>` can signal the recorded process group explicitly.
+`pbb kill` writes a kill request into the owning instance mailbox. A live `pi-background-bash` runtime polls that mailbox and aborts the matching in-process job. Jobs record `pid`/`pgid`, so the runtime kills the full process group. If the owner is confirmed stale, `pbb kill --stale --instance <id> <job>` can signal the recorded process group explicitly. This direct-signal mode is refused when owner liveness is unknown; ordinary `pbb kill` can still queue a cooperative request.
 
 ## Configuration
 
-Default auto-background threshold: `30` seconds.
+Default auto-background threshold: `60` seconds.
 
 Configure the global threshold in `~/.pi-background-bash/config.json`:
 
@@ -159,6 +194,8 @@ npm test
 ```
 
 This repo uses Lefthook for local pre-commit checks. The test suite uses [`pi-mock`](https://github.com/sshkeda/pi-mock) to exercise the extension against a real Pi process.
+
+Tests resolve the CLI from the installed `@earendil-works/pi-coding-agent` package instead of using a global `pi`. Set `PBB_TEST_PI_BINARY=/absolute/path/to/pi` to exercise another installation explicitly. Codemode tests enable `builtin:codemode` with `--tools bash,codemode`; they cover completed results, nonzero exits, output truncation, background acknowledgements/completions, and timeout/abort behavior. `pi-mock` is isolated in a private test workspace so its older peer dependencies do not determine the runtime under test.
 
 ## License
 

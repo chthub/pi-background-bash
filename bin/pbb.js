@@ -155,12 +155,14 @@ function readPilInstances(id) {
 
 function ownerInfo(id, job) {
   const state = readPilInstances(id).find((item) => item.instanceId === job.instanceId);
+  // A missing heartbeat is not evidence that the owner has disconnected.
+  const live = typeof state?.live === "boolean" ? state.live : null;
   return {
     ownerStatus: state?.status || "unknown",
     ownerLastSeenAt: state?.lastSeenAt || "",
     ownerLastSeenAgeMs: state?.lastSeenAgeMs,
-    ownerLive: Boolean(state?.live),
-    ownerStale: !state?.live,
+    ownerLive: live,
+    ownerStale: live === null ? null : !live,
   };
 }
 
@@ -243,7 +245,7 @@ function printSelf(id, opts) {
 function formatJob(job) {
   const age = job.startedAt ? `${Math.max(0, Math.round((Date.now() - Date.parse(job.startedAt)) / 1000))}s` : "?";
   const exit = job.exitCode === undefined || job.exitCode === null ? "" : ` exit=${job.exitCode}`;
-  const owner = job.ownerLive ? "owner=live" : `owner=stale status=${job.ownerStatus || "unknown"}`;
+  const owner = job.ownerLive === true ? "owner=live" : job.ownerStale === true ? `owner=stale status=${job.ownerStatus || "unknown"}` : "owner=unknown";
   const pgid = job.pgid ? ` pgid=${job.pgid}` : "";
   return `- job=${job.jobId} global=${job.globalJobId} status=${job.status}${exit} age=${age} instance=${job.instanceId} ${owner}${pgid} cmd=${JSON.stringify(job.command ?? "")}`;
 }
@@ -346,7 +348,11 @@ function printKill(id, jobId, opts) {
     return;
   }
   const signal = opts.signal || "TERM";
-  if (opts.stale && job.ownerStale && job.pgid) {
+  if (opts.stale && job.ownerStale === null) {
+    console.error(context("pbb.error", { session_key: id.sessionKey, instance_id: id.instanceId, scope, job_id: job.jobId, owner_instance_id: job.instanceId, error: "owner_liveness_unknown" }, "Owner liveness is unknown: no pi-lane heartbeat is available. Refusing --stale process-group kill. Use pbb kill without --stale to queue a cooperative request."));
+    process.exit(4);
+  }
+  if (opts.stale && job.ownerStale === true && job.pgid) {
     const sent = signalProcessGroup(Number(job.pgid), signal);
     const { _path, ...jobWithoutInternal } = job;
     const patch = { ...jobWithoutInternal, status: sent.ok ? "kill_requested" : job.status, staleKillRequestedAt: new Date().toISOString(), staleKillSignal: signal, staleKillError: sent.error };
@@ -369,7 +375,11 @@ function printKill(id, jobId, opts) {
     requestedAt: new Date().toISOString(),
   };
   writeJsonFile(join(requestsDir(id, job.instanceId), `${requestId}.json`), request);
-  const warning = job.ownerStale ? `\nOwner instance appears stale. Cooperative kill is queued but may not be honored. If this is a PBB-runner job with pgid, use: pbb kill ${job.jobId} --instance ${job.instanceId} --stale` : "";
+  const warning = job.ownerStale === true
+    ? `\nOwner instance appears stale. Cooperative kill is queued but may not be honored. If this is a PBB-runner job with pgid, use: pbb kill ${job.jobId} --instance ${job.instanceId} --stale`
+    : job.ownerLive === null
+      ? "\nOwner liveness is unknown: no pi-lane heartbeat is available. The cooperative request is queued, but delivery cannot be confirmed from heartbeat data."
+      : "";
   console.log(context("pbb.kill", { session_id: id.sessionId, session_key: id.sessionKey, instance_id: id.instanceId, lane: id.lane, scope, job_id: job.jobId, owner_instance_id: job.instanceId, request_id: requestId, status: job.status, owner_live: job.ownerLive, requested: true }, `kill requested for ${job.jobId}\nThe owning pi-background-bash runtime will abort the job if it is still live.${warning}`));
 }
 

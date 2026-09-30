@@ -3,11 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AgentToolUpdateCallback, BashToolDetails, ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 
 type TruncationInfo = { truncated: boolean; originalLines: number; keptLines: number; originalBytes: number; maxLines: number; maxBytes: number };
 
@@ -51,7 +52,8 @@ function piContext(input: { source: string; kind: string; id?: string; attrs?: R
 const MAX_ACTIVE_JOBS = 10;
 const MAX_RESULT_LINES = 2000;
 const MAX_RESULT_BYTES = 50 * 1024;
-const DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS = 30;
+const MAX_STRUCTURED_OUTPUT_BYTES = 1024 * 1024;
+const DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS = 60;
 const CUSTOM_TYPE = "background_bash_result";
 
 type Outcome = "running" | "exit" | "timeout" | "abort" | "error";
@@ -80,7 +82,7 @@ type BashParams = {
 	background?: boolean;
 };
 
-type CompletedBashRun =
+type CompletedBashRun = { output: string } & (
 	| {
 			status: "success";
 			result: AgentToolResult<BashToolDetails>;
@@ -96,7 +98,7 @@ type CompletedBashRun =
 			details: BashToolDetails | undefined;
 			outcome: Outcome;
 			exitCode: number | null;
-	  };
+	  });
 
 type PbbIdentity = {
 	sessionId?: string;
@@ -145,6 +147,20 @@ const schema = Type.Object({
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
 	background: Type.Optional(Type.Boolean({ description: "Run immediately in the background and return a job id" })),
 });
+
+// Codemode callers receive machine-readable results, while direct tool calls
+// retain the existing human-readable content and error presentation.
+const outputSchema = Type.Object({
+	status: Type.Union([Type.Literal("completed"), Type.Literal("running")]),
+	output: Type.String({ description: "Combined stdout and stderr for completed commands, up to 1 MiB plus an omission marker. Empty for running acknowledgements." }),
+	exit_code: Type.Union([Type.Number(), Type.Null()], { description: "Exit status, or null while the job is still running" }),
+	wall_time_seconds: Type.Number(),
+	truncated: Type.Boolean(),
+	full_output_path: Type.Optional(Type.String({ description: "File containing complete untrimmed output when structured output is truncated" })),
+	job_id: Type.Optional(Type.String({ description: "Background job to inspect with pbb; a running acknowledgement is not completion" })),
+});
+
+type StructuredBashOutput = Static<typeof outputSchema>;
 
 const JOB_ID_PREFIX = "bg";
 const JOB_ID_WIDTH = 3;
@@ -733,14 +749,18 @@ async function runPbbBash(
 		job.pgid = child.pid;
 		writePbbJob(job, { pid: child.pid, pgid: child.pid, runner: "pbb" });
 
-		const append = (chunk: Buffer) => {
-			output += chunk.toString("utf8");
+		const append = (textChunk: string) => {
+			if (!textChunk) return;
+			output += textChunk;
 			const text = truncateLiveBody(output.replace(/\s*$/, ""));
 			onUpdate?.({ content: text ? [{ type: "text", text }] : [], details: {} as BashToolDetails });
 			appendPbbLogDelta(job, output);
 		};
-		child.stdout.on("data", append);
-		child.stderr.on("data", append);
+		for (const stream of [child.stdout, child.stderr]) {
+			const decoder = new StringDecoder("utf8");
+			stream.on("data", (chunk: Buffer) => append(decoder.write(chunk)));
+			stream.on("end", () => append(decoder.end()));
+		}
 
 		const abort = () => {
 			aborted = true;
@@ -764,28 +784,28 @@ async function runPbbBash(
 		}
 
 		child.on("error", (error) => {
-			finish({ status: "error", error, body: error.message, details: undefined, outcome: "error", exitCode: null });
+			finish({ output, status: "error", error, body: error.message, details: undefined, outcome: "error", exitCode: null });
 		});
 
 		child.on("close", (code, signalName) => {
 			if (timedOut) {
 				const body = completionBody(output, `Command timed out after ${params.timeout} seconds`);
-				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "timeout", exitCode: null });
+				finish({ output, status: "error", error: new Error(body), body, details: undefined, outcome: "timeout", exitCode: null });
 				return;
 			}
 			if (aborted || signalName) {
 				const body = completionBody(output, "Command aborted");
-				finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "abort", exitCode: null });
+				finish({ output, status: "error", error: new Error(body), body, details: undefined, outcome: "abort", exitCode: null });
 				return;
 			}
 			if (code === 0) {
 				const result: AgentToolResult<BashToolDetails> = { content: output ? [{ type: "text", text: output.replace(/\s*$/, "") }] : [], details: {} as BashToolDetails };
-				finish({ status: "success", result, body: getText(result), details: result.details, outcome: "exit", exitCode: 0 });
+				finish({ output, status: "success", result, body: getText(result), details: result.details, outcome: "exit", exitCode: 0 });
 				return;
 			}
 			const exitCode = code ?? 1;
 			const body = completionBody(output, `Command exited with code ${exitCode}`);
-			finish({ status: "error", error: new Error(body), body, details: undefined, outcome: "exit", exitCode });
+			finish({ output, status: "error", error: new Error(body), body, details: undefined, outcome: "exit", exitCode });
 		});
 	});
 }
@@ -856,9 +876,53 @@ function truncateBackgroundBody(job: ActiveJob, body: string): string {
 	return truncateBodyWithHint(body, fullOutputHint);
 }
 
-function truncateForegroundResult(job: ActiveJob, completed: Extract<CompletedBashRun, { status: "success" }>): AgentToolResult<BashToolDetails> {
+function completedStructuredOutput(job: ActiveJob, completed: CompletedBashRun): StructuredBashOutput {
+	const bytes = Buffer.from(completed.output, "utf8");
+	const truncated = bytes.length > MAX_STRUCTURED_OUTPUT_BYTES;
+	let output = completed.output;
+	let fullOutputPath: string | undefined;
+	if (truncated) {
+		const half = MAX_STRUCTURED_OUTPUT_BYTES / 2;
+		let headEnd = half;
+		let tailStart = bytes.length - half;
+		// Keep valid UTF-8 at both cut points rather than manufacturing replacement characters.
+		while (headEnd > 0 && (bytes[headEnd] & 0xc0) === 0x80) headEnd--;
+		while (tailStart < bytes.length && (bytes[tailStart] & 0xc0) === 0x80) tailStart++;
+		output = `${bytes.subarray(0, headEnd).toString("utf8")}\n[... output omitted ...]\n${bytes.subarray(tailStart).toString("utf8")}`;
+		fullOutputPath = writeForegroundFullOutput(completed.output);
+	}
+	return {
+		status: "completed",
+		output,
+		exit_code: completed.exitCode,
+		wall_time_seconds: Math.round((Date.now() - job.startedAt) / 100) / 10,
+		truncated,
+		...(fullOutputPath ? { full_output_path: fullOutputPath } : {}),
+	};
+}
+
+function runningStructuredOutput(job: ActiveJob): StructuredBashOutput {
+	return {
+		status: "running",
+		output: "",
+		exit_code: null,
+		wall_time_seconds: Math.round((Date.now() - job.startedAt) / 100) / 10,
+		truncated: false,
+		job_id: job.id,
+	};
+}
+
+function foregroundResult(job: ActiveJob, completed: CompletedBashRun): AgentToolResult<BashToolDetails> {
+	// Timeouts, signals and spawn failures still reject. A normal nonzero exit
+	// resolves with structuredContent for scripts and remains an error to the model.
+	if (completed.status === "error" && completed.outcome !== "exit") rethrowBashError(completed, job);
 	const body = truncateForegroundBody(job, completed.body);
-	return { content: body ? [{ type: "text", text: body }] : [], details: completed.result.details };
+	return {
+		content: body ? [{ type: "text", text: body }] : [],
+		details: completed.details ?? {},
+		structuredContent: completedStructuredOutput(job, completed),
+		...(completed.status === "error" ? { isError: true } : {}),
+	};
 }
 
 function buildXmlResult(job: ActiveJob, outcome: Outcome, exitCode: number | null, durationMs: number, body: string): string {
@@ -1092,6 +1156,7 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 			"Do not use bash for interactive commands that require stdin unless the user explicitly asks for that behavior.",
 		],
 		parameters: schema,
+		outputSchema,
 		async execute(toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<BashToolDetails | BackgroundBashDetails>> {
 			const autoAfterSeconds = getAutoBackgroundAfterSeconds(ctx.cwd);
 
@@ -1133,6 +1198,7 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `Bash job ${job.id} started in background. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
 					details: runningJobDetails(job, ctx.cwd),
+					structuredContent: runningStructuredOutput(job),
 				};
 			}
 
@@ -1151,8 +1217,7 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 				else signal?.addEventListener("abort", forwardAbort, { once: true });
 				try {
 					const completed = await runPbbBash(job, ctx.cwd, params, onUpdate);
-					if (completed.status === "success") return truncateForegroundResult(job, completed);
-					rethrowBashError(completed, job);
+					return foregroundResult(job, completed);
 				} finally {
 					signal?.removeEventListener("abort", forwardAbort);
 					activeJobs.delete(job.id);
@@ -1192,8 +1257,7 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 			if (winner !== "background") {
 				signal?.removeEventListener("abort", forwardAbort);
 				activeJobs.delete(job.id);
-				if (winner.status === "success") return truncateForegroundResult(job, winner);
-				rethrowBashError(winner, job);
+				return foregroundResult(job, winner);
 			}
 
 			backgrounded = true;
@@ -1220,6 +1284,7 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: `Bash job ${job.id} moved to background after ${formatThreshold(autoAfterSeconds)}. A follow-up result will arrive when it finishes; continue independent work. Use pbb only if you need progress before completion.` }],
 				details: runningJobDetails(job, ctx.cwd),
+				structuredContent: runningStructuredOutput(job),
 			};
 		},
 	});

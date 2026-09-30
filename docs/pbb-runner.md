@@ -10,7 +10,8 @@ PBB is the baseline bash runner for pi-background-bash v1.
 - Jobs record `pid` and `pgid` for process-group control.
 - `pbb list`, `pbb status`, and `pbb tail` inspect the recorded job state/logs.
 - `pbb kill` requests live owner shutdown through the instance mailbox.
-- `pbb kill --stale --instance <id> <job>` explicitly signals a stale recorded process group.
+- Owner liveness is live, stale, or unknown. A missing `pi-lane` heartbeat means unknown (`ownerLive: null`, `ownerStale: null`), not stale.
+- `pbb kill --stale --instance <id> <job>` explicitly signals a confirmed stale recorded process group. Unknown liveness refuses direct signaling; cooperative mailbox requests remain available.
 - Completed background jobs send a `background_bash_result` context message. During an active agent turn, Pi can deliver it at the next tool-batch boundary, between tool calls; it does not interrupt an in-progress tool call or require waiting for `agent_end`. When idle, delivery triggers an agent turn.
 - Verbose completion messages are truncated in-session and point to `pbb tail <job> --full` for complete output.
 

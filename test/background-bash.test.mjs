@@ -1,15 +1,37 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createMock, createControllableBrain, script, text, toolCall } from "pi-mock";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createMock, createControllableBrain, script, text, toolCall } from "./harness/index.mjs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 const EXT = new URL("../extensions/background-bash.ts", import.meta.url).pathname;
 const PBB_CLI = new URL("../bin/pbb.js", import.meta.url).pathname;
 const PIL_CLI = new URL("../node_modules/pi-lane/bin/pil.js", import.meta.url).pathname;
 const TIMEOUT = 45_000;
+const PI_BINARY = resolvePiBinary();
+const CODEMODE_RESULT_PREFIX = "PBB_CODEMODE_RESULT=";
+
+function resolvePiBinary() {
+  if (process.env.PBB_TEST_PI_BINARY) return resolve(process.env.PBB_TEST_PI_BINARY);
+  // Read the installed package's actual bin entry: recent Pi releases bundle
+  // the CLI under dist/bundle, and a global `pi` may be a different version.
+  let directory = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
+  while (true) {
+    const packagePath = join(directory, "package.json");
+    if (existsSync(packagePath)) {
+      const pkg = JSON.parse(readFileSync(packagePath, "utf8"));
+      if (pkg.name === "@earendil-works/pi-coding-agent" && pkg.bin?.pi) {
+        return join(directory, pkg.bin.pi);
+      }
+    }
+    const parent = dirname(directory);
+    if (parent === directory) throw new Error("Cannot resolve the installed Pi CLI");
+    directory = parent;
+  }
+}
 
 const bg = (command, timeout) =>
   toolCall("bash", timeout == null ? { command, background: true } : { command, timeout, background: true });
@@ -63,6 +85,7 @@ async function createBgMock(brain, options = {}) {
   const { extensions = [], ...rest } = options;
   return createMock({
     brain,
+    piBinary: PI_BINARY,
     extensions: [EXT, ...extensions],
     // pi-mock's Anthropic route misses Pi's /v1/v1/messages?beta=true URL;
     // use its OpenAI Responses route to exercise the extension instead.
@@ -71,6 +94,40 @@ async function createBgMock(brain, options = {}) {
     startupTimeoutMs: 20_000,
     runTimeoutMs: TIMEOUT,
     ...rest,
+  });
+}
+
+function codemode(code) {
+  return toolCall("codemode", { code });
+}
+
+function codemodeJson(events) {
+  const result = events.find((event) => event.type === "tool_execution_end" && event.toolName === "codemode");
+  assert.ok(result, "expected a real codemode tool result");
+  assert.equal(result.isError, false, JSON.stringify(result.result));
+  const output = result.result.content.find((part) => part.type === "text" && part.text.startsWith(CODEMODE_RESULT_PREFIX));
+  assert.ok(output, `missing codemode JSON output: ${JSON.stringify(result.result)}`);
+  return JSON.parse(output.text.slice(CODEMODE_RESULT_PREFIX.length));
+}
+
+function assertCompletedResult(value, output, exitCode = 0) {
+  assert.equal(typeof value, "object");
+  assert.equal(value.status, "completed");
+  assert.equal(value.output, output);
+  assert.equal(value.exit_code, exitCode);
+  assert.equal(value.truncated, false);
+  assert.equal(typeof value.wall_time_seconds, "number");
+  assert.ok(Number.isFinite(value.wall_time_seconds) && value.wall_time_seconds >= 0);
+  assert.equal(value.full_output_path, undefined);
+}
+
+const CODEMODE_PI_ARGS = ["-e", "builtin:codemode", "--tools", "bash,codemode"];
+
+function createCodemodeMock(brain, options) {
+  return createBgMock(brain, {
+    ...options,
+    piArgs: CODEMODE_PI_ARGS,
+    env: { HOME: options.cwd, PBB_ROOT: join(options.cwd, "pbb"), ...options.env },
   });
 }
 
@@ -90,6 +147,194 @@ async function waitForCondition(predicate, timeoutMs = TIMEOUT) {
   }
   throw new Error("Timed out waiting for condition");
 }
+
+for (const autoBackgroundAfterSeconds of [0, 5]) {
+  test(`codemode bash resolves completed objects preserving whitespace, stderr, and empty output (auto ${autoBackgroundAfterSeconds}s)`, async () => {
+    const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds });
+    const commands = ["printf '  codemode-ok \\n\\n'", ":", "printf '\\tstderr-only \\n' >&2"];
+    const mock = await createCodemodeMock(script(
+      codemode(`
+        const values = [];
+        for (const command of ${JSON.stringify(commands)}) values.push(await tools.bash({ command }));
+        text(${JSON.stringify(CODEMODE_RESULT_PREFIX)} + JSON.stringify(values));
+      `),
+      text("checked completed bash objects"),
+    ), { cwd });
+
+    try {
+      const values = codemodeJson(await mock.run("inspect programmatic bash results", TIMEOUT));
+      assert.equal(values.length, 3);
+      assertCompletedResult(values[0], "  codemode-ok \n\n");
+      assertCompletedResult(values[1], "");
+      assertCompletedResult(values[2], "\tstderr-only \n");
+    } finally {
+      await mock.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const autoBackgroundAfterSeconds of [0, 5]) {
+  test(`codemode bash resolves nonzero exits while direct bash remains an error result (auto ${autoBackgroundAfterSeconds}s)`, async () => {
+    const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds });
+    const command = "printf 'exit-seven\\n'; exit 7";
+    const mock = await createCodemodeMock(script(
+      codemode(`text(${JSON.stringify(CODEMODE_RESULT_PREFIX)} + JSON.stringify(await tools.bash({ command: ${JSON.stringify(command)} })));`),
+      sh(command),
+      text("checked both nonzero exit contracts"),
+    ), { cwd });
+
+    try {
+      const events = await mock.run("inspect exit seven through codemode and direct bash", TIMEOUT);
+      assertCompletedResult(codemodeJson(events), "exit-seven\n", 7);
+      const direct = events.filter((event) => event.type === "tool_execution_end" && event.toolName === "bash").at(-1);
+      assert.ok(direct, "expected direct bash result");
+      assert.equal(direct.isError, true);
+      assert.match(JSON.stringify(direct.result.content), /Command exited with code 7/);
+      assertCompletedResult(direct.result.structuredContent, "exit-seven\n", 7);
+    } finally {
+      await mock.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("codemode bash caps structured output at its UTF-8 boundaries and saves the full snapshot", async () => {
+  const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 0 });
+  // Both 512 KiB cuts bisect a multibyte character. Keep the large value inside
+  // codemode so Pi's separate model-facing output cap does not hide a failure.
+  const command = "python3 - <<'PY'\nimport sys\nsys.stdout.write('X' + '\u{1f642}' * 140000 + 'MIDDLE_OMITTED' + '\u20ac' * 200000)\nPY";
+  const mock = await createCodemodeMock(script(
+    codemode(`
+      const value = await tools.bash({ command: ${JSON.stringify(command)} });
+      const expected = 'X' + '\u{1f642}'.repeat(Math.floor((512 * 1024 - 1) / 4))
+        + '\\n[... output omitted ...]\\n' + '\u20ac'.repeat(Math.floor(512 * 1024 / 3));
+      text(${JSON.stringify(CODEMODE_RESULT_PREFIX)} + JSON.stringify({
+        ...value, output: undefined, output_length: value.output.length,
+        exact_head_tail: value.output === expected,
+        has_replacement_character: value.output.includes('\ufffd'),
+      }));
+    `),
+    text("checked bounded structured output"),
+  ), { cwd });
+  let fullOutputPath;
+
+  try {
+    const value = codemodeJson(await mock.run("inspect large Unicode bash output", TIMEOUT));
+    fullOutputPath = value.full_output_path;
+    assert.equal(value.status, "completed");
+    assert.equal(value.exit_code, 0);
+    assert.equal(value.truncated, true);
+    assert.equal(value.exact_head_tail, true);
+    assert.equal(value.has_replacement_character, false);
+    assert.ok(value.output_length < 1024 * 1024 + 128);
+    assert.equal(typeof value.wall_time_seconds, "number");
+    assert.equal(typeof fullOutputPath, "string");
+    assert.equal(readFileSync(fullOutputPath, "utf8"), "X" + "\u{1f642}".repeat(140000) + "MIDDLE_OMITTED" + "\u20ac".repeat(200000));
+  } finally {
+    await mock.close();
+    if (fullOutputPath) rmSync(fullOutputPath, { force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const explicit of [true, false]) {
+  const mode = explicit ? "explicit" : "automatic";
+  test(`codemode bash ${mode} backgrounding returns running acknowledgement before completion`, async () => {
+    const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: explicit ? 5 : 0.1 });
+    const command = `printf 'early-output\\n'; sleep 0.5; printf '${mode}-codemode-done\\n'`;
+    const args = explicit ? { command, background: true } : { command };
+    const mock = await createCodemodeMock(script(
+      codemode(`text(${JSON.stringify(CODEMODE_RESULT_PREFIX)} + JSON.stringify(await tools.bash(${JSON.stringify(args)})));`),
+      text("received background acknowledgement"),
+      text("received actual background completion"),
+    ), { cwd });
+
+    try {
+      const value = codemodeJson(await mock.run(`inspect ${mode} background bash acknowledgement`, TIMEOUT));
+      assert.equal(value.status, "running");
+      assert.equal(value.output, "");
+      assert.equal(value.exit_code, null);
+      assert.equal(value.truncated, false);
+      assert.equal(value.job_id, "bg001");
+      assert.equal(typeof value.wall_time_seconds, "number");
+      assert.ok(value.wall_time_seconds >= 0);
+      assert.equal(value.full_output_path, undefined);
+
+      const { request } = await mock.waitForRequest((req) => backgroundResultText(req).includes(`${mode}-codemode-done`), TIMEOUT);
+      const completion = backgroundResultText(request);
+      assert.match(completion, /id="bg001"/);
+      assert.match(completion, /outcome="exit"/);
+      assert.match(completion, /exit_code="0"/);
+      assert.match(completion, /early-output/);
+      assert.match(completion, new RegExp(`${mode}-codemode-done`));
+    } finally {
+      await mock.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const autoBackgroundAfterSeconds of [0, 5]) {
+  test(`codemode bash timeout rejects instead of resolving a completed result (auto ${autoBackgroundAfterSeconds}s)`, async () => {
+    const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds });
+    const mock = await createCodemodeMock(script(
+      codemode(`
+        try {
+          const value = await tools.bash({ command: 'sleep 5', timeout: 0.2 });
+          text(${JSON.stringify(CODEMODE_RESULT_PREFIX)} + JSON.stringify({ rejected: false, value }));
+        } catch (error) {
+          text(${JSON.stringify(CODEMODE_RESULT_PREFIX)} + JSON.stringify({ rejected: true, message: String(error) }));
+        }
+      `),
+      text("checked timeout rejection"),
+    ), { cwd });
+
+    try {
+      const result = codemodeJson(await mock.run("inspect timeout rejection", TIMEOUT));
+      assert.equal(result.rejected, true);
+      assert.match(result.message, /Command timed out after 0\.2 seconds/);
+      assert.equal(result.value, undefined);
+    } finally {
+      await mock.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("codemode bash abort fails the script and terminates the foreground process", async () => {
+  const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 0 });
+  const pidPath = join(cwd, "abort.pid");
+  const marker = join(cwd, "should-not-finish");
+  const command = "printf '%s' \"$$\" > abort.pid; sleep 30; printf finished > should-not-finish";
+  const mock = await createCodemodeMock(script(
+    codemode(`text(${JSON.stringify(CODEMODE_RESULT_PREFIX)} + JSON.stringify(await tools.bash({ command: ${JSON.stringify(command)} })));`),
+    text("abort must not produce a normal continuation"),
+  ), { cwd });
+
+  try {
+    await mock.prompt("start a foreground command then abort it");
+    const pid = await waitForCondition(() => existsSync(pidPath) && Number(readFileSync(pidPath, "utf8")));
+    await mock.abort();
+    const result = await mock.waitFor((event) => event.type === "tool_execution_end" && event.toolName === "codemode", TIMEOUT);
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.result.content), /abort|cancel/i);
+    assert.doesNotMatch(JSON.stringify(result.result.content), /PBB_CODEMODE_RESULT=/);
+    await waitForCondition(() => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        if (error.code === "ESRCH") return true;
+        throw error;
+      }
+    });
+    assert.equal(existsSync(marker), false);
+  } finally {
+    await mock.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("bash override returns normal results before the auto-background threshold", async () => {
   const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 5 });
@@ -589,6 +834,11 @@ test("pbb shows pi-lane owner liveness and stale status", () => {
     const session = execFileSync(process.execPath, [PBB_CLI, "list", "--scope", "session"], { env, encoding: "utf8" });
     assert.match(session, /owner=live/);
     assert.match(session, /owner=stale/);
+    const jobs = JSON.parse(execFileSync(process.execPath, [PBB_CLI, "list", "--scope", "session", "--json"], { env, encoding: "utf8" })).jobs;
+    assert.equal(jobs.find((job) => job.instanceId === "current").ownerLive, true);
+    assert.equal(jobs.find((job) => job.instanceId === "current").ownerStale, false);
+    assert.equal(jobs.find((job) => job.instanceId === "stale").ownerLive, false);
+    assert.equal(jobs.find((job) => job.instanceId === "stale").ownerStale, true);
     const instances = execFileSync(process.execPath, [PBB_CLI, "instances"], { env, encoding: "utf8" });
     assert.match(instances, /instance=current live=true/);
     assert.match(instances, /instance=stale live=false/);
@@ -596,6 +846,65 @@ test("pbb shows pi-lane owner liveness and stale status", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const otherHeartbeat of [false, true]) {
+  test(`pbb reports missing owner heartbeat as unknown and refuses stale kill (other heartbeat ${otherHeartbeat})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-unknown-${process.pid}-`));
+    const pbbRoot = join(dir, "pbb");
+    const laneRoot = join(dir, "lane");
+    const key = "unknown-key";
+    const instance = "unknown-owner";
+    const base = join(pbbRoot, "sessions", key, "instances", instance);
+    const jobPath = join(base, "jobs", "bg001.json");
+    mkdirSync(dirname(jobPath), { recursive: true });
+    if (otherHeartbeat) {
+      const laneBase = join(laneRoot, "sessions", key, "instances");
+      mkdirSync(laneBase, { recursive: true });
+      writeFileSync(join(laneBase, "other.json"), JSON.stringify({ instanceId: "other", status: "idle", lastSeenAt: new Date().toISOString() }));
+    }
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    child.unref();
+
+    try {
+      const recordedJob = { jobId: "bg001", globalJobId: `${instance}:bg001`, status: "running", command: "unknown owner", startedAt: new Date().toISOString(), instanceId: instance, runner: "pbb", pid: child.pid, pgid: child.pid };
+      writeFileSync(jobPath, JSON.stringify(recordedJob));
+      // Exercise PBB's fallback identity, as in a real session without pi-lane.
+      const env = { ...process.env, PBB_ROOT: pbbRoot, PBB_SESSION_KEY: key, PBB_SESSION_ID: "unknown-session", PBB_INSTANCE_ID: instance, PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: "", PI_LANE_SESSION_ID: "", PI_LANE_SESSION_FILE: "", PI_LANE_INSTANCE_ID: "", PBB_PIL_BIN: PIL_CLI };
+      const runCli = (...args) => execFileSync(process.execPath, [PBB_CLI, ...args], { env, encoding: "utf8", stdio: "pipe" });
+      const listed = runCli("list");
+      assert.match(listed, /owner=unknown/);
+      assert.doesNotMatch(listed, /owner=stale/);
+      for (const args of [["list", "--json"], ["status", "bg001", "--json"], ["tail", "bg001", "--json"]]) {
+        const result = JSON.parse(runCli(...args));
+        const job = result.job ?? result.jobs[0];
+        assert.equal(job.ownerStatus, "unknown");
+        assert.equal(job.ownerLive, null);
+        assert.equal(job.ownerStale, null);
+      }
+      assert.throws(() => runCli("kill", "bg001", "--stale"), (error) => {
+        assert.equal(error.status, 4);
+        assert.match(String(error.stderr), /owner_liveness_unknown/);
+        return true;
+      });
+      assert.deepEqual(JSON.parse(readFileSync(jobPath, "utf8")), recordedJob);
+      assert.equal(existsSync(join(base, "requests")), false);
+      process.kill(child.pid, 0);
+
+      const queued = runCli("kill", "bg001");
+      assert.match(queued, /kill requested for bg001/);
+      assert.match(queued, /Owner liveness is unknown/);
+      assert.doesNotMatch(queued, /appears stale|use: pbb kill .*--stale/);
+      const requests = readdirSync(join(base, "requests")).map((file) => JSON.parse(readFileSync(join(base, "requests", file), "utf8")));
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].jobId, "bg001");
+      process.kill(child.pid, 0);
+    } finally {
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+      await waitForCondition(() => child.exitCode !== null || child.signalCode !== null, 5_000);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("pbb lists and tails current pi-lane instance background jobs", async () => {
   const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-pbb-${process.pid}-${Date.now()}-`));
@@ -869,6 +1178,10 @@ test("pbb kill --stale can signal a recorded stale process group", async () => {
   const marker = join(dir, "should-not-exist");
   const key = "stale-kill-key";
   const instance = "stale-owner";
+  const laneRoot = join(dir, "lane");
+  const laneBase = join(laneRoot, "sessions", key, "instances");
+  mkdirSync(laneBase, { recursive: true });
+  writeFileSync(join(laneBase, `${instance}.json`), JSON.stringify({ instanceId: instance, status: "disconnected", lastSeenAt: "2000-01-01T00:00:00.000Z" }));
   const jobDir = join(pbbRoot, "sessions", key, "instances", instance, "jobs");
   mkdirSync(jobDir, { recursive: true });
   const child = spawn("bash", ["-lc", `sleep 5; echo survived > ${JSON.stringify(marker)}`], { detached: true, stdio: "ignore" });
@@ -876,7 +1189,7 @@ test("pbb kill --stale can signal a recorded stale process group", async () => {
 
   try {
     writeFileSync(join(jobDir, "bg999.json"), JSON.stringify({ jobId: "bg999", globalJobId: `${instance}:bg999`, status: "running", command: "stale", startedAt: new Date().toISOString(), instanceId: instance, runner: "pbb", pid: child.pid, pgid: child.pid }));
-    const env = { ...process.env, PBB_ROOT: pbbRoot, PI_LANE_SESSION_KEY: key, PI_LANE_SESSION_ID: "stale-session", PI_LANE_INSTANCE_ID: "current" };
+    const env = { ...process.env, PBB_ROOT: pbbRoot, PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: key, PI_LANE_SESSION_ID: "stale-session", PI_LANE_INSTANCE_ID: "current", PBB_PIL_BIN: PIL_CLI };
     const out = execFileSync(process.execPath, [PBB_CLI, "kill", "bg999", "--instance", instance, "--stale"], { env, encoding: "utf8" });
     assert.match(out, /stale process-group kill sent/);
     await waitForCondition(() => {
@@ -956,8 +1269,12 @@ test("session start repairs detached background bash tool results before replay"
     await mock.run("continue after repair", TIMEOUT);
     const repaired = readSessionEntries(sessionFile).find((entry) => entry.id === "detached-result");
     assert.equal(repaired.parentId, "assistant-call");
-    const request = requestText(mock.requests.at(-1));
-    assert.ok(request.indexOf(toolCallId) !== -1, "expected repaired tool call id to remain in model context");
+    const apiItems = mock.requests.at(-1)._raw.input;
+    const call = apiItems.find((item) => item.type === "function_call" && item.name === "bash");
+    const result = apiItems.find((item) => item.type === "function_call_output");
+    assert.equal(call.call_id, toolCallId.split("|")[0]);
+    assert.equal(result.call_id, call.call_id);
+    assert.match(result.output, /Bash job bg001 moved to background/);
   } finally {
     await mock.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1111,7 +1428,7 @@ test("bash background true truncates verbose PBB results and pbb tail --full ret
     await mock.run("start a verbose background command", TIMEOUT);
     const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /Showing lines \d+-\d+ of \d+\. Full output: pbb tail bg001 --full/);
+    assert.match(textReq, /\[truncated tail: kept 2000\/2105 lines, max 51200 bytes\. Full output: pbb tail bg001 --full\]/);
     assert.match(textReq, /line 2104/);
     assert.doesNotMatch(textReq, /line 0\nline 1\nline 2/);
 
