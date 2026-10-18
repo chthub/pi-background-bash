@@ -1,5 +1,14 @@
 # pi-background-bash
 
+> **Archived — no longer maintained.** Development has moved to
+> [pi-async-bash](https://github.com/chthub/pi-async-bash), a thin wrapper around Pi's native bash tool.
+> This repository is retained for reference and will not receive fixes or updates.
+>
+> To migrate, remove/disable this package in Pi (use `pi list` to find its installed source), then install:
+> `pi install git:github.com/chthub/pi-async-bash`.
+> Do not load both bash overrides together. The replacement uses `bash_jobs` instead of the `pbb` CLI;
+> see its [README](https://github.com/chthub/pi-async-bash#readme) for behavior and migration limits.
+
 Async/background `bash` for [Pi](https://github.com/earendil-works/pi): keep using the normal `bash` tool, but long-running commands stop blocking the agent.
 
 `pi-background-bash` replaces Pi's bash execution with the PBB runner and adds two quality-of-life features:
