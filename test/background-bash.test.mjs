@@ -6,6 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 
 const EXT = new URL("../extensions/background-bash.ts", import.meta.url).pathname;
 const PBB_CLI = new URL("../bin/pbb.js", import.meta.url).pathname;
@@ -56,6 +57,10 @@ function messageTexts(req) {
     for (const part of message.content ?? []) {
       if (typeof part.text === "string") out.push(part.text);
       if (typeof part.content === "string") out.push(part.content);
+      if (typeof part.output === "string") out.push(part.output);
+      if (Array.isArray(part.output)) {
+        for (const output of part.output) if (typeof output.text === "string") out.push(output.text);
+      }
     }
   }
   return out;
@@ -375,84 +380,149 @@ test("bash override truncates verbose foreground results before they enter model
   }
 });
 
-test("context guard trims oversized historical tool results before replay", async () => {
-  const dir = mkdtempSync(join(tmpdir(), `pi-background-bash-context-guard-${process.pid}-${Date.now()}-`));
-  const sessionFile = join(dir, "session.jsonl");
-  const now = new Date().toISOString();
-  const toolCallId = "call_contextGuard123|fc_contextGuard456";
-  const hugeResult = [
-    "HUGE_CONTEXT_START should be trimmed away",
-    ...Array.from({ length: 6000 }, (_, i) => `HUGE_CONTEXT_LINE_${String(i).padStart(5, "0")} ${"x".repeat(80)}`),
-    "HUGE_CONTEXT_END should remain",
-  ].join("\n");
-  const entries = [
-    { type: "session", version: 3, id: "context-guard-session", timestamp: now, cwd: dir },
-    {
-      type: "message",
-      id: "user-root",
-      parentId: null,
-      timestamp: now,
-      message: { role: "user", content: [{ type: "text", text: "run huge historical command" }], timestamp: Date.now() },
-    },
-    {
-      type: "message",
-      id: "assistant-call",
-      parentId: "user-root",
-      timestamp: now,
-      message: {
-        role: "assistant",
-        content: [{ type: "toolCall", id: toolCallId, name: "bash", arguments: { command: "python huge.py" } }],
-        stopReason: "toolUse",
-        provider: "faux",
-        api: "faux",
-        model: "faux",
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        timestamp: Date.now(),
-      },
-    },
-    {
-      type: "message",
-      id: "huge-result",
-      parentId: "assistant-call",
-      timestamp: now,
-      message: {
-        role: "toolResult",
-        toolCallId,
-        toolName: "bash",
-        content: [{ type: "text", text: hugeResult }],
-        details: {},
-        timestamp: Date.now(),
-      },
-    },
-    {
-      type: "message",
-      id: "followup-user",
-      parentId: "huge-result",
-      timestamp: now,
-      message: { role: "user", content: [{ type: "text", text: "continue after huge output" }], timestamp: Date.now() },
-    },
-  ];
-  writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
-
+test("oversized codemode output survives tool activation without rewriting the request prefix", async () => {
+  const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 5 });
+  const probePath = join(cwd, "enable-probe.ts");
+  const payloadPath = join(cwd, "payloads.jsonl");
+  const hugeResult = "HUGE_RESULT_START" + "汉".repeat(25000) + "HUGE_RESULT_END";
+  writeFileSync(probePath, `
+    import { appendFileSync } from 'node:fs';
+    export default function (pi) {
+      const parameters = { type: 'object', properties: {}, additionalProperties: false };
+      pi.registerTool({
+        name: 'enable_extra', label: 'Enable extra', description: 'Enable the extra tool', parameters, exposure: 'model-only',
+        async execute() {
+          pi.registerTool({
+            name: 'extra_tool', label: 'Extra', description: 'A dynamically enabled tool',
+            parameters, exposure: 'model-only',
+            async execute() { return { content: [{ type: 'text', text: 'extra' }], details: {} }; },
+          });
+          pi.setActiveTools([...pi.getActiveTools(), 'extra_tool']);
+          return { content: [{ type: 'text', text: 'extra enabled' }], details: {} };
+        },
+      });
+      // The mock uses gpt-4o's Responses transport. Opt into the same transcript
+      // capabilities as Codex; otherwise Pi legitimately checkpoints tool changes.
+      pi.on('session_start', (_event, ctx) => {
+        ctx.model.compat = { ...ctx.model.compat, supportsMidConvoSystemMessages: true, supportsAdditionalTools: true };
+      });
+      // Observe only: returning a replacement payload would change the behavior under test.
+      pi.on('before_provider_request', (event) => {
+        appendFileSync(${JSON.stringify(payloadPath)}, JSON.stringify(event.payload) + '\\n');
+      });
+    }
+  `);
   const mock = await createBgMock(script(
-    text("context guard kept request small"),
-  ), { sessionFile, cwd: dir });
+    codemode('text("HUGE_RESULT_START" + "汉".repeat(25000) + "HUGE_RESULT_END");'),
+    toolCall("enable_extra", {}),
+    text("kept the original prefix and complete codemode result"),
+  ), {
+    cwd, extensions: [probePath], env: { HOME: cwd, PBB_ROOT: join(cwd, "pbb") },
+    piArgs: ["-e", "builtin:codemode"],
+  });
 
   try {
-    await mock.run("continue after huge historical output", TIMEOUT);
-    const request = requestText(mock.requests.at(-1));
-    // Newer Pi may compact the old result before our context guard runs.
-    assert.ok(request.includes("bash result trimmed by pi-background-bash context guard") || request.includes("context guard kept request small"));
-    if (request.includes("bash result trimmed by pi-background-bash context guard")) {
-      assert.match(request, /HUGE_CONTEXT_END should remain/);
+    await mock.setActiveTools(["bash", "codemode", "enable_extra"]);
+    const events = await mock.run("emit a large result then enable another tool", TIMEOUT);
+    const emitted = events.find((event) => event.type === "tool_execution_end" && event.toolName === "codemode");
+    assert.ok(emitted);
+    assert.equal(emitted.isError, false, JSON.stringify(emitted.result));
+    const enabled = events.find((event) => event.type === "tool_execution_end" && event.toolName === "enable_extra");
+    assert.ok(enabled, "must actually execute the tool loader");
+    assert.equal(enabled.isError, false, JSON.stringify(enabled.result));
+    const payloads = readSessionEntries(payloadPath);
+    assert.equal(payloads.length, 3);
+    for (const payload of payloads.slice(1)) {
+      assert.equal(payload.instructions, payloads[0].instructions);
+      assert.deepEqual(payload.input[0], payloads[0].input[0]);
+      assert.deepEqual(payload.tools, payloads[0].tools);
+      assert.ok(JSON.stringify(payload.input).includes(hugeResult), "must preserve the entire non-bash result");
+      assert.doesNotMatch(JSON.stringify(payload), /pi-background-bash context guard/);
     }
-    assert.doesNotMatch(request, /HUGE_CONTEXT_START should be trimmed away/);
-    assert.ok(request.length < 180_000, `historical tool result was not capped enough (${request.length} chars)`);
+    const input = payloads[2].input;
+    const deltaIndex = input.findIndex((item) => item.type === "additional_tools" && item.tools.some((tool) => tool.name === "extra_tool"));
+    assert.ok(deltaIndex > 0, "tool activation must stay in a mid-conversation additional_tools message");
+    assert.equal(input[deltaIndex].role, "developer");
+    assert.equal(payloads[0].tools.some((tool) => tool.name === "extra_tool"), false);
   } finally {
     await mock.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+const tailCases = [
+  { name: "exact byte limit", body: "x".repeat(DEFAULT_MAX_BYTES) },
+  { name: "exact line limit", body: Array.from({ length: DEFAULT_MAX_LINES }, (_, i) => `line ${i}`).join("\n") },
+  { name: "line overflow", body: Array.from({ length: DEFAULT_MAX_LINES + 105 }, (_, i) => `line ${i}`).join("\n") },
+  { name: "byte overflow with complete lines", body: Array.from({ length: 1000 }, (_, i) => `${i} ${"x".repeat(100)}`).join("\n") },
+  { name: "single long Unicode line", body: "汉🙂".repeat(15000) },
+  { name: "literal closing tag", body: "x".repeat(DEFAULT_MAX_BYTES) + "\n</pi_context> still output" },
+];
+
+for (const { name, body } of tailCases) {
+  for (const background of [false, true]) {
+    test(`bash ${background ? "background" : "foreground/live"} output uses Pi truncateTail: ${name}`, async () => {
+      const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 5 });
+      writeFileSync(join(cwd, "output.txt"), body);
+      const env = {
+        HOME: cwd, PBB_ROOT: join(cwd, "pbb"), PBB_PIL_BIN: PIL_CLI,
+        PI_LANE_SESSION_ID: "tail-test", PI_LANE_SESSION_KEY: "tail-test",
+        PI_LANE_INSTANCE_ID: "tail-instance", PI_LANE_SESSION_FILE: join(cwd, "session.jsonl"),
+        PI_LANE_ROOT: join(cwd, "lane"), PI_LANE_CURRENT_LANE: "main",
+      };
+      const mock = await createBgMock(script(
+        background ? bg("cat output.txt") : sh("cat output.txt"),
+        text("received result or acknowledgement"),
+        ...(background ? [text("received completion")] : []),
+      ), { cwd, env });
+      try {
+        const events = await mock.run("read the output fixture", TIMEOUT);
+        const expected = truncateTail(body);
+        let result;
+        if (background) {
+          const { request } = await mock.waitForRequest((req) => backgroundResultText(req).includes('outcome="exit"'), TIMEOUT);
+          const envelope = backgroundResultText(request);
+          assert.equal((envelope.match(/<\/pi_context>/g) ?? []).length, 1);
+          result = envelope.slice(envelope.indexOf("\n") + 1, envelope.lastIndexOf("\n</pi_context>"));
+          result = result.replace(/<\\\/pi_context>/g, "</pi_context>");
+        } else {
+          const end = events.find((event) => event.type === "tool_execution_end" && event.toolName === "bash");
+          assert.ok(end);
+          result = end.result.content[0].text;
+          const updates = events.filter((event) => event.type === "tool_execution_update" && event.toolName === "bash");
+          assert.ok(updates.length > 0, "must exercise live output too");
+          const lastUpdate = updates.at(-1).partialResult.content[0].text;
+          assert.equal(lastUpdate.split("\n\n[Showing ")[0], expected.content);
+        }
+        assert.equal(result.split("\n\n[Showing ")[0], expected.content);
+        assert.doesNotMatch(result, /\ufffd/);
+        assert.ok(Buffer.byteLength(expected.content) <= DEFAULT_MAX_BYTES);
+        assert.ok(expected.outputLines <= DEFAULT_MAX_LINES);
+        if (expected.truncated) {
+          assert.match(result, /\[Showing .*Full output: /);
+          if (background) {
+            assert.match(result, /Full output: pbb tail bg001 --full/);
+            const full = execFileSync(process.execPath, [PBB_CLI, "tail", "bg001", "--full", "--json"], {
+              env: { ...process.env, ...env }, encoding: "utf8",
+            });
+            assert.ok(JSON.parse(full).log.includes(body));
+          } else {
+            const fullPath = result.match(/Full output: (.*)\]$/)[1];
+            assert.equal(readFileSync(fullPath, "utf8"), body);
+            // The model must receive this once-truncated result unchanged, even
+            // though the notice makes it larger than the output-body limit.
+            assert.ok(messageTexts(mock.requests.at(-1)).includes(result));
+          }
+        } else {
+          assert.equal(result, body);
+        }
+      } finally {
+        await mock.close();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+}
 
 test("bash override preserves shell semantics, cwd, environment, redirects, pipes, and subshells", async () => {
   const cwd = makeConfiguredCwd({ autoBackgroundAfterSeconds: 5 });
@@ -1428,7 +1498,7 @@ test("bash background true truncates verbose PBB results and pbb tail --full ret
     await mock.run("start a verbose background command", TIMEOUT);
     const { request } = await mock.waitForRequest((req, i) => i >= 2 && requestText(req).includes("<pi_context"), TIMEOUT);
     const textReq = backgroundResultText(request);
-    assert.match(textReq, /\[truncated tail: kept 2000\/2105 lines, max 51200 bytes\. Full output: pbb tail bg001 --full\]/);
+    assert.match(textReq, /\[Showing lines 106-2105 of 2105\. Full output: pbb tail bg001 --full\]/);
     assert.match(textReq, /line 2104/);
     assert.doesNotMatch(textReq, /line 0\nline 1\nline 2/);
 

@@ -75,6 +75,14 @@ Completion results arrive as Pi context messages, including while the agent cont
 
 Commands run through the PBB-owned bash runner (`bash -lc`) so background jobs have recorded `pid`/`pgid` and can be killed as process groups. Verbose completion messages are truncated in-session with a `pbb tail <job> --full` hint; the full output is kept in the PBB log. See [`docs/pbb-runner.md`](docs/pbb-runner.md) for the v1 runner contract.
 
+### Output limits
+
+PBB adds background job management and reuses Pi's public `truncateTail` utility and default limits for foreground results, live updates, and background completion bodies: the last **2000 lines or 50 KiB**, whichever limit is reached first. It retains complete lines where possible; if the final line alone exceeds the byte limit, it keeps a UTF-8-safe suffix of that line. Truncation notices are appended outside the body limit, as in Pi's native bash tool. Background message envelopes are also outside that limit.
+
+Truncated results include a full-output log path or `pbb tail <job> --full` hint. Live updates point to the eventual result/full-output snapshot. Escaping of closing `pi_context` tags is applied only when wrapping background completion messages, not to ordinary foreground output.
+
+The extension does **not** register a global `context` guard or trim other tools' results or historical messages. Each tool (including codemode) is responsible for its own output limits; Pi retains ownership of conversation context and dynamic tool declarations.
+
 ### Codemode return values
 
 In Pi 0.99.1 codemode scripts, `await tools.bash(...)` returns a structured object. Foreground commands that exit normally return:
@@ -176,7 +184,7 @@ No global Pi prompt patch is required.
 
 ## Fork notes
 
-This fork inlines the small context-formatting/truncation helpers that upstream imported from `pi-context`, and inlines the pending-job widget that upstream imported from `pi-pending`.
+This fork inlines the small message-envelope formatter that upstream imported from `pi-context`, and the pending-job widget that upstream imported from `pi-pending`. Output truncation reuses Pi's public utilities rather than a local truncation algorithm. PBB retains its process runner for PID/process-group tracking and job control; it does not import Pi's private output accumulator.
 
 `pi-lane` is intentionally kept as the only runtime package dependency. `pbb` uses it for multi-instance Pi identity and owner liveness, so commands such as `pbb list`, `pbb status`, and `pbb kill` can distinguish jobs owned by the current live Pi instance from jobs owned by other or stale instances.
 

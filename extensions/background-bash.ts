@@ -4,40 +4,11 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renam
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AgentToolUpdateCallback, BashToolDetails, ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
-import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
-
-type TruncationInfo = { truncated: boolean; originalLines: number; keptLines: number; originalBytes: number; maxLines: number; maxBytes: number };
-
-function byteLength(text: string): number {
-	return Buffer.byteLength(text, "utf8");
-}
-
-function truncateContextText(text: string, options: { mode?: "tail"; maxLines: number; maxBytes: number; appendNotice?: boolean }): { content: string; truncation?: TruncationInfo } {
-	const lines = text.split(/\r?\n/);
-	const originalBytes = byteLength(text);
-	let kept = lines;
-	if (lines.length > options.maxLines) kept = lines.slice(-options.maxLines);
-	let content = kept.join("\n");
-	while (byteLength(content) > options.maxBytes && kept.length > 1) {
-		kept = kept.slice(Math.max(1, Math.ceil(kept.length * 0.1)));
-		content = kept.join("\n");
-	}
-	if (byteLength(content) > options.maxBytes) {
-		const buf = Buffer.from(content, "utf8");
-		content = buf.subarray(Math.max(0, buf.length - options.maxBytes)).toString("utf8");
-	}
-	const truncated = lines.length !== kept.length || originalBytes > options.maxBytes;
-	const truncation = truncated ? { truncated, originalLines: lines.length, keptLines: kept.length, originalBytes, maxLines: options.maxLines, maxBytes: options.maxBytes } : undefined;
-	return { content, truncation };
-}
-
-function formatTruncationNotice(truncation: TruncationInfo, mode: "tail" = "tail"): string {
-	return `[truncated ${mode}: kept ${truncation.keptLines}/${truncation.originalLines} lines, max ${truncation.maxBytes} bytes]`;
-}
 
 function piContext(input: { source: string; kind: string; id?: string; attrs?: Record<string, unknown>; body?: string }): string {
 	const escapeAttr = (value: unknown) => String(value ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r/g, "&#13;").replace(/\n/g, "&#10;");
@@ -50,8 +21,6 @@ function piContext(input: { source: string; kind: string; id?: string; attrs?: R
 }
 
 const MAX_ACTIVE_JOBS = 10;
-const MAX_RESULT_LINES = 2000;
-const MAX_RESULT_BYTES = 50 * 1024;
 const MAX_STRUCTURED_OUTPUT_BYTES = 1024 * 1024;
 const DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS = 60;
 const CUSTOM_TYPE = "background_bash_result";
@@ -810,46 +779,27 @@ async function runPbbBash(
 	});
 }
 
-function shouldTruncateBody(body: string): boolean {
-	return Boolean(truncateContextText(body, { mode: "tail", maxLines: MAX_RESULT_LINES, maxBytes: MAX_RESULT_BYTES, appendNotice: false }).truncation?.truncated);
-}
-
 function escapePiContextClosingTags(text: string): string {
 	return text.replace(/<\/pi_context>/gi, "<\\/pi_context>");
 }
 
-function addFullOutputHintToNotice(notice: string, fullOutputHint: string): string {
-	return notice.endsWith("]") ? `${notice.slice(0, -1)}. Full output: ${fullOutputHint}]` : `${notice} Full output: ${fullOutputHint}`;
-}
-
-function truncateBodyWithHint(body: string, fullOutputHint: string): string {
-	const { content, truncation } = truncateContextText(body, { mode: "tail", maxLines: MAX_RESULT_LINES, maxBytes: MAX_RESULT_BYTES, appendNotice: false });
-	if (!truncation?.truncated) return body;
-	return `${escapePiContextClosingTags(content)}\n\n${addFullOutputHintToNotice(formatTruncationNotice(truncation, "tail"), fullOutputHint)}`;
-}
-
-function trimOversizedToolResultsForContext(messages: AgentMessage[]): AgentMessage[] | undefined {
-	let changed = false;
-	const next = messages.map((message) => {
-		const record = asRecord(message);
-		if (record?.role !== "toolResult") return message;
-		const content = Array.isArray(record.content) ? record.content : [];
-		let contentChanged = false;
-		const nextContent = content.map((part) => {
-			const item = asRecord(part);
-			if (item?.type !== "text" || typeof item.text !== "string" || !shouldTruncateBody(item.text)) return part;
-			contentChanged = true;
-			const toolName = typeof record.toolName === "string" ? record.toolName : "tool";
-			return {
-				...part,
-				text: truncateBodyWithHint(item.text, `${toolName} result trimmed by pi-background-bash context guard`),
-			};
-		});
-		if (!contentChanged) return message;
-		changed = true;
-		return { ...message, content: nextContent } as AgentMessage;
-	});
-	return changed ? next : undefined;
+function truncateBodyWithHint(body: string, fullOutputHint: () => string): string {
+	// Use Pi's public tail truncator for all model-facing bash output. As in
+	// native bash, the limits cover the output body, not the appended notice.
+	const truncation = truncateTail(body);
+	if (!truncation.truncated) return body;
+	const hint = fullOutputHint();
+	const endLine = truncation.totalLines;
+	let notice: string;
+	if (truncation.lastLinePartial) {
+		const lastLine = body.replace(/\n$/, "").split("\n").at(-1) ?? "";
+		notice = `Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${formatSize(Buffer.byteLength(lastLine, "utf8"))})`;
+	} else {
+		const startLine = endLine - truncation.outputLines + 1;
+		const limit = truncation.truncatedBy === "bytes" ? ` (${formatSize(truncation.maxBytes)} limit)` : "";
+		notice = `Showing lines ${startLine}-${endLine} of ${endLine}${limit}`;
+	}
+	return `${truncation.content}\n\n[${notice}. Full output: ${hint}]`;
 }
 
 function writeForegroundFullOutput(body: string): string {
@@ -861,19 +811,15 @@ function writeForegroundFullOutput(body: string): string {
 }
 
 function truncateForegroundBody(job: ActiveJob | undefined, body: string): string {
-	if (!shouldTruncateBody(body)) return body;
-	const fullOutputHint = job?.pbb ? `pbb tail ${job.id} --full` : writeForegroundFullOutput(body);
-	return truncateBodyWithHint(body, fullOutputHint);
+	return truncateBodyWithHint(body, () => job?.pbb ? `pbb tail ${job.id} --full` : writeForegroundFullOutput(body));
 }
 
 function truncateLiveBody(body: string): string {
-	if (!shouldTruncateBody(body)) return body;
-	return truncateBodyWithHint(body, "final tool result/full-output snapshot");
+	return truncateBodyWithHint(body, () => "final tool result/full-output snapshot");
 }
 
 function truncateBackgroundBody(job: ActiveJob, body: string): string {
-	const fullOutputHint = job.pbb ? `pbb tail ${job.id} --full` : writeForegroundFullOutput(body);
-	return truncateBodyWithHint(body, fullOutputHint);
+	return truncateForegroundBody(job, body);
 }
 
 function completedStructuredOutput(job: ActiveJob, completed: CompletedBashRun): StructuredBashOutput {
@@ -1137,15 +1083,10 @@ export default function backgroundBashExtension(pi: ExtensionAPI) {
 		pendingJobs.detach();
 	});
 
-	pi.on("context", (event) => {
-		const messages = trimOversizedToolResultsForContext(event.messages);
-		if (messages) return { messages };
-	});
-
 	pi.registerTool({
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Verbose background results are truncated with the full output available through pbb tail. Set background: true to run immediately in the background and get a job id. Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024} KiB (whichever is hit first), with full output available through the indicated log file or pbb tail. Set background: true to run immediately in the background and get a job id. Otherwise, if the command is still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default), it is automatically moved to the background; a <pi_context source="pi-background-bash" kind="background_bash_result"> message is injected when it finishes. Optionally provide a timeout in seconds.`,
 		promptSnippet: `Execute bash commands (ls, grep, find, etc.); timeout is in seconds. Set background: true for long-running non-interactive commands. Commands still running after the configured auto-background threshold (${formatThreshold(DEFAULT_AUTO_BACKGROUND_AFTER_SECONDS)} by default) automatically move to background and wake you with a pi-background-bash result when finished.`,
 		promptGuidelines: [
 			"Use bash with background: true for long-running non-interactive commands such as builds, full test suites, dev servers, watchers, deploys, downloads, or commands you do not need before the next step.",
